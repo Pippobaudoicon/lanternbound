@@ -126,3 +126,62 @@ hud = { players: [{ name, color /* css string */, hp, maxHp, downed, reviveProgr
 x/z in -1..1 (z+ = toward camera/down-screen). dash = pressed this frame.
 P1: WASD + Space (or Shift-left). P2: Arrows + Enter (or Shift-right / Numpad0).
 Gamepad 0 → P1, gamepad 1 → P2 (left stick, A/Cross to dash).
+
+---
+
+# Online co-op (v2)
+
+Host-authoritative. The host's browser runs the full simulation (game.js) with
+P1 = host's keyboard/pad, P2 = inputs received from the guest. The guest renders
+state snapshots + replays one-shot events (fx/audio/banners). A Cloudflare Worker
+serves the static build and a Durable Object `Room` per room code relays WebSocket
+messages between exactly one host and one guest. The relay is dumb: it never
+inspects game messages.
+
+## Relay protocol (worker/index.js, Durable Object `Room`)
+- Endpoint: `GET /ws/<CODE>?role=host|guest` with WebSocket upgrade. CODE is
+  normalized to uppercase; allowed chars `[A-Z0-9-]`, max 16, else HTTP 400.
+- host: if the room already has a host -> accept then close with code 4001 "room taken".
+- guest: no host -> close 4004 "no such room"; already a guest -> close 4003 "room full".
+- When the second player connects, the server sends `{"t":"peer","on":true}` to BOTH
+  sockets; when one disconnects it sends `{"t":"peer","on":false}` to the other.
+- Every other text message from one socket is forwarded verbatim to the other.
+- Use the WebSocket Hibernation API (`ctx.acceptWebSocket(ws, [role])`,
+  `ctx.getWebSockets(role)`, `webSocketMessage`, `webSocketClose`). SQLite-backed DO
+  (`new_sqlite_classes` migration) so it runs on the free plan.
+- Static assets: `dist/` via the Workers assets binding; only `/ws/*` runs the worker first.
+
+## net.js (client)
+```js
+export function makeRoomCode() => string      // e.g. 'EMBER-42': cozy word + 2 digits
+export function createNet() => {
+  connect(code, role) => Promise<void>,        // resolves on open; rejects Error(reason)
+                                               // on 4001/4003/4004 close or network failure
+  send(obj),                                   // JSON.stringify; no-op if not open
+  onMessage(fn),                               // fn(obj) for every peer message (parsed),
+                                               // NOT including {t:'peer'} control messages
+  onPeer(fn),                                  // fn(on: boolean) on {t:'peer'} messages
+  onClose(fn),                                 // fn(reason) when the socket closes unexpectedly
+  close(),
+  connected: boolean (getter), rtt: number (smoothed ms, getter; 0 if unknown),
+}
+```
+URL: `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/${code}?role=${role}`.
+RTT: net.js may send its own `{t:'ping', s}` / `{t:'pong', s}` every 2s and must swallow them
+(not passed to onMessage).
+
+## ui.js additions (lobby)
+```js
+showTitle({ couch(), host(), join(code) }),    // replaces showTitle(onStart). Three choices:
+                                               // "Play here together" (couch, default: Enter/Space),
+                                               // "Host online", "Join a friend" (reveals a code
+                                               // input + Join button; Enter in the input submits).
+showLobby(state, { start(), cancel() }),       // may be called repeatedly to update state:
+  state = { role: 'host'|'guest', code, link,  // link = shareable URL with #CODE
+            status: 'connecting'|'waiting'|'ready'|'error', message? }
+  // host waiting: big code, "Copy link" button, "Waiting for your friend…";
+  // host ready: "Your friend is here!" + Start button (+ "Press Enter to begin");
+  // guest ready: "Connected — waiting for the host to start…"; error: message + Back.
+hideLobby(),
+setNetStatus(text | null),                     // small HUD pill e.g. "Online · 38 ms"; null hides
+```
